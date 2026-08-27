@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# รวม utility ดูแล fleet parts-inventory (app01-15 + conductor) ที่เคยรันแบบ ad-hoc
+# ไว้เป็นคำสั่งเดียว — สร้างจากงานจริงเมื่อ 26 ส.ค. 2569 (token fix ทั้ง 5 selenium-farm
+# runner ที่ค้าง OOM + disk cleanup ทั้ง fleet กู้คืนได้ ~48GB)
+#
+# ไม่ hardcode รายชื่อ pve host/vmid — discover สดทุกครั้งผ่าน pvecm + pct list
+# เพราะ mapping เปลี่ยนได้ตลอด (เจอ conductor/app08 ถูก evacuate ย้าย host 27 ส.ค. 2569
+# และ pve05 เป็น node ที่ไม่เคยรู้จักมาก่อนจนกว่าจะเช็คคลัสเตอร์ตรงๆ)
+#
+# ใช้งาน:
+#   fleet-utils discover              # แสดง mapping ปัจจุบันของทุก LXC ทุก pve node
+#   fleet-utils runner-status         # เช็คสถานะ GitHub Actions runner ทั้ง 5 ตัว (app11-15)
+#   fleet-utils runner-fix <app-name> # re-register runner ตัวเดียว (แก้ token ค้าง/OOM)
+#   fleet-utils runner-fix-all        # ไล่แก้ทุกตัวที่ busy=false (ข้ามตัวที่กำลังทำงาน)
+#   fleet-utils disk-survey [host]    # สำรวจ disk usage หา candidate ลบ (read-only)
+#   fleet-utils disk-clean-safe <host> # ลบเฉพาะ cache/log ที่ปลอดภัยชัดเจน (npm/apt/journal)
+#
+# ข้อควรระวัง: runner-fix-all และ disk-clean-safe เป็น destructive action จริง
+# ต้อง confirm ทีละเครื่องเสมอ ไม่ auto-run ข้ามเครื่องโดยไม่ถาม
+
+set -euo pipefail
+
+GH_REPO="ppongprom/parts-inventory"
+
+# ---------- discover: หา pve host + vmid ของทุก LXC สดจากคลัสเตอร์จริง ----------
+cluster_nodes() {
+  ssh root@pve01 "pvecm nodes 2>&1" | awk '/^ *[0-9]+ / {gsub(/\(local\)/,"",$3); print $3}'
+}
+
+discover() {
+  echo "=== Proxmox cluster nodes ==="
+  cluster_nodes
+  echo
+  echo "=== LXC/VM mapping สดตอนนี้ ==="
+  printf "%-8s %-6s %-16s %-10s %s\n" "PVE" "VMID" "NAME" "STATUS" "LOCK"
+  for h in $(cluster_nodes); do
+    ssh -o ConnectTimeout=5 root@"$h" "pct list 2>/dev/null" 2>/dev/null | tail -n +2 | awk -v host="$h" '
+      { status=$2; lock=""; name=$NF; if (NF==4) lock=$3;
+        printf "%-8s %-6s %-16s %-10s %s\n", host, $1, name, status, lock }'
+  done
+}
+
+# หา pve host ปัจจุบันของ container ชื่อที่ระบุ (คืนค่า "pvehost vmid")
+locate_lxc() {
+  local target="$1"
+  for h in $(cluster_nodes); do
+    local vmid
+    vmid=$(ssh -o ConnectTimeout=5 root@"$h" "pct list 2>/dev/null" 2>/dev/null | tail -n +2 | awk -v t="$target" '$NF==t {print $1}')
+    if [[ -n "$vmid" ]]; then
+      echo "$h $vmid"
+      return 0
+    fi
+  done
+  echo "ไม่พบ container ชื่อ '$target' บน node ไหนเลย" >&2
+  return 1
+}
+
+# ---------- runner-status: เช็ค GitHub Actions self-hosted runner ----------
+runner_status() {
+  gh api "repos/${GH_REPO}/actions/runners" --jq '.runners[] | "\(.name)\t\(.status)\tbusy=\(.busy)"' | column -t
+}
+
+# ---------- runner-fix: re-register runner ตัวเดียว (แก้ token ค้าง) ----------
+# root cause ที่เจอจริง: GitHub Actions runner complete-job ล้มเหลวด้วย
+# VssUnauthorizedException แล้ว worker process ค้างกิน CPU/RAM จนถูก kernel OOM-kill
+# วิธีแก้ที่ถูกต้องคือ re-register ใหม่ทั้งชุด (stop -> uninstall -> ลบ credential เก่า
+# -> ลบ registration ฝั่ง GitHub -> config.sh ใหม่ -> ติดตั้ง service ใหม่)
+# แค่ restart service เฉยๆ ไม่พอ (เคยลองแล้วไม่หาย)
+runner_fix() {
+  local app="$1"
+  local hostvmid
+  hostvmid=$(locate_lxc "$app")
+  local pvehost vmid
+  read -r pvehost vmid <<< "$hostvmid"
+
+  echo ">> ${app} อยู่บน ${pvehost} (vmid ${vmid})"
+
+  local busy status
+  read -r status busy <<< "$(gh api "repos/${GH_REPO}/actions/runners" --jq ".runners[] | select(.name==\"${app}-runner\") | \"\(.status) \(.busy)\"")"
+  if [[ "$busy" == "true" && "$status" == "online" ]]; then
+    echo "!! ${app}-runner ยัง busy=true และ online=true (กำลังรันงานจริง) — ข้าม ไม่ปลอดภัยที่จะ stop"
+    return 1
+  fi
+
+  echo ">> stop service"
+  ssh root@"$pvehost" "pct exec $vmid -- systemctl stop actions.runner.*.${app}-runner.service" || true
+
+  echo ">> uninstall service wrapper"
+  ssh root@"$pvehost" "pct exec $vmid -- bash -c 'cd /home/conductor/actions-runner && sudo ./svc.sh uninstall'" || true
+
+  echo ">> ลบ credential/registration เก่าในเครื่อง"
+  ssh root@"$pvehost" "pct exec $vmid -- rm -f /home/conductor/actions-runner/.runner /home/conductor/actions-runner/.credentials /home/conductor/actions-runner/.credentials_rsaparams /home/conductor/actions-runner/.runner_migrated"
+
+  echo ">> ลบ registration ฝั่ง GitHub"
+  local rid
+  rid=$(gh api "repos/${GH_REPO}/actions/runners" --jq ".runners[] | select(.name==\"${app}-runner\") | .id")
+  if [[ -n "$rid" ]]; then
+    gh api -X DELETE "repos/${GH_REPO}/actions/runners/${rid}" || echo "   (ลบไม่สำเร็จ อาจ busy อยู่ — จะลองต่อด้วย token ใหม่)"
+  fi
+
+  echo ">> ออก registration token ใหม่ (หมดอายุใน 1 ชม.)"
+  local token
+  token=$(gh api -X POST "repos/${GH_REPO}/actions/runners/registration-token" --jq '.token')
+
+  echo ">> config.sh register ใหม่"
+  ssh root@"$pvehost" "pct exec $vmid -- bash -c 'cd /home/conductor/actions-runner && sudo -u conductor ./config.sh --url https://github.com/${GH_REPO} --token ${token} --name ${app}-runner --labels self-hosted,Linux,X64,selenium-farm,${app} --work _work --unattended'"
+
+  echo ">> ติดตั้ง + start service"
+  ssh root@"$pvehost" "pct exec $vmid -- bash -c 'cd /home/conductor/actions-runner && sudo ./svc.sh install conductor && sudo ./svc.sh start'"
+
+  echo ">> เสร็จ — ${app}-runner ควรกลับมา online"
+}
+
+runner_fix_all() {
+  for app in app11 app12 app13 app14 app15; do
+    echo "=== ${app} ==="
+    runner_fix "$app" || echo "   (ข้าม ${app})"
+    echo
+  done
+  echo "=== สถานะสุดท้าย ==="
+  runner_status
+}
+
+# ---------- disk-survey: สำรวจ candidate ที่ปลอดภัยจะลบ (read-only) ----------
+disk_survey() {
+  local app="${1:?ระบุชื่อ container เช่น app01}"
+  local hostvmid pvehost vmid
+  hostvmid=$(locate_lxc "$app")
+  read -r pvehost vmid <<< "$hostvmid"
+
+  echo ">> ${app} (${pvehost}, vmid ${vmid})"
+  ssh root@"$pvehost" "pct exec $vmid -- df -h /"
+  echo
+  echo "-- top-level usage --"
+  ssh root@"$pvehost" "pct exec $vmid -- bash -c 'du -sh /* 2>/dev/null | sort -rh | head -10'"
+  echo
+  echo "-- candidate ที่มักปลอดภัย (เช็คว่ามีจริงก่อน) --"
+  ssh root@"$pvehost" "pct exec $vmid -- bash -c '
+    for p in /root/.npm /home/ammonium/.npm /home/conductor/.npm \
+             /home/ammonium/.cache/ms-playwright /home/conductor/.cache/ms-playwright \
+             /var/cache/apt /var/log/journal \
+             /home/ammonium/actions-runner/*.2.3*.0 /home/conductor/actions-runner/*.2.3*.0 \
+             /home/ammonium/actions-runner/_work/_update /home/conductor/actions-runner/_work/_update; do
+      [ -e \"\$p\" ] && du -sh \"\$p\" 2>/dev/null
+    done
+    true
+  '"
+}
+
+# ---------- disk-clean-safe: ลบเฉพาะ cache/log ที่ยืนยันปลอดภัยแล้ว ----------
+# หมายเหตุ: ครอบคลุมเฉพาะ pattern ที่เจอซ้ำๆ ทุกเครื่องเมื่อ 26 ส.ค. 2569
+# (npm cache, apt cache, journal เก่ากว่า 7 วัน, orchestrator/actions-runner เวอร์ชันเก่า)
+# ไม่แตะ worktree (/srv/agents/wt-t*) เพราะต้องเช็ค merge status ทีละตัวก่อนเสมอ
+# ห้ามรันตัวนี้แบบไม่ดู output — ให้เช็ค df -h ก่อน/หลังทุกครั้ง
+disk_clean_safe() {
+  local app="${1:?ระบุชื่อ container เช่น app01}"
+  local hostvmid pvehost vmid
+  hostvmid=$(locate_lxc "$app")
+  read -r pvehost vmid <<< "$hostvmid"
+
+  echo ">> ${app} (${pvehost}, vmid ${vmid}) — ก่อนลบ"
+  ssh root@"$pvehost" "pct exec $vmid -- df -h /"
+
+  ssh root@"$pvehost" "pct exec $vmid -- bash -c '
+    rm -rf /root/.npm/_cacache /home/ammonium/.npm/_cacache /home/conductor/.npm/_cacache
+    rm -rf /home/ammonium/.cache/ms-playwright/.local-browsers 2>/dev/null
+    apt-get clean
+    journalctl --vacuum-time=7d
+    find /home/ammonium/actions-runner /home/conductor/actions-runner -maxdepth 1 \
+      -regex \".*\\.2\\.[0-9]+\\.[0-9]+\$\" ! -newer /home/conductor/actions-runner/bin -exec rm -rf {} + 2>/dev/null
+    rm -rf /home/ammonium/actions-runner/_work/_update /home/conductor/actions-runner/_work/_update 2>/dev/null
+    find /tmp -maxdepth 1 -name \"org.chromium.Chromium.scoped_dir.*\" -exec rm -rf {} + 2>/dev/null
+    true
+  '"
+
+  echo ">> หลังลบ"
+  ssh root@"$pvehost" "pct exec $vmid -- df -h /"
+}
+
+# ---------- main ----------
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  discover)        discover ;;
+  runner-status)    runner_status ;;
+  runner-fix)       runner_fix "${1:?ระบุชื่อ app เช่น app11}" ;;
+  runner-fix-all)   runner_fix_all ;;
+  disk-survey)      disk_survey "$@" ;;
+  disk-clean-safe)  disk_clean_safe "$@" ;;
+  *)
+    echo "ใช้งาน: fleet-utils {discover|runner-status|runner-fix|runner-fix-all|disk-survey|disk-clean-safe} [args]"
+    echo "ดูรายละเอียดที่คอมเมนต์หัวไฟล์ (~/.local/bin/fleet-utils)"
+    exit 1
+    ;;
+esac
