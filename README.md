@@ -32,6 +32,18 @@ fleet-utils disk-clean-safe <app01> # ลบเฉพาะ cache/log ที่�
 **ข้อควรระวัง:** `runner-fix-all` และ `disk-clean-safe` เป็น destructive action จริง — ทดสอบ
 `discover`/`runner-status`/`disk-survey` (read-only) ก่อนเสมอ แล้วค่อยรันตัวที่แก้ไขจริงทีละเครื่อง
 
+## bin/cpu-clock
+
+วัดความเร็ว CPU ของทุก node ในคลัสเตอร์ (pve01-06) — ทั้ง clock ที่ตั้งไว้ (lscpu) และ
+compute throughput จริง (openssl speed sha256 พร้อมกันทุก node) เพราะ MHz อย่างเดียวไม่บอกว่า
+เครื่องไหนช้าจริงเวลามีงานพร้อมกันหลายตัว ไม่ต้องติดตั้งอะไรเพิ่ม (lscpu/openssl มีอยู่แล้วทุกเครื่อง)
+
+```
+cpu-clock static   # lscpu ของทุก node (model, min/max MHz, จำนวน core)
+cpu-clock bench    # openssl speed sha256 จริง พร้อมกันทุก node (~10 วิ)
+cpu-clock all      # ทั้งสองอย่าง (ค่าเริ่มต้นถ้าไม่ระบุ)
+```
+
 ## บริบทเพิ่มเติม
 
 Root cause ของปัญหา runner ค้าง OOM (ที่ `runner-fix` แก้) และรายละเอียด cluster mapping
