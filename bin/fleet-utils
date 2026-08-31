@@ -14,6 +14,7 @@
 #   fleet-utils runner-fix-all        # ไล่แก้ทุกตัวที่ busy=false (ข้ามตัวที่กำลังทำงาน)
 #   fleet-utils disk-survey [host]    # สำรวจ disk usage หา candidate ลบ (read-only)
 #   fleet-utils disk-clean-safe <host> # ลบเฉพาะ cache/log ที่ปลอดภัยชัดเจน (npm/apt/journal)
+#   fleet-utils fix-ssh-keys <name/IP> # เติม standard key set ให้ container ที่ authorized_keys ไม่ครบ
 #
 # ข้อควรระวัง: runner-fix-all และ disk-clean-safe เป็น destructive action จริง
 # ต้อง confirm ทีละเครื่องเสมอ ไม่ auto-run ข้ามเครื่องโดยไม่ถาม
@@ -53,6 +54,62 @@ locate_lxc() {
   done
   echo "ไม่พบ container ชื่อ '$target' บน node ไหนเลย" >&2
   return 1
+}
+
+# หา pve host ปัจจุบันของ container จาก IP (คืนค่า "pvehost vmid")
+# ใช้ตอนไม่รู้ชื่อ container แต่รู้แค่ IP — เช่นเวลา SSH เข้าไม่ได้จาก IP ตรงๆ
+locate_lxc_by_ip() {
+  local ip="$1"
+  for h in $(cluster_nodes); do
+    local vmid
+    vmid=$(ssh -o ConnectTimeout=5 root@"$h" "pct list 2>/dev/null" 2>/dev/null | tail -n +2 | awk '{print $1}' | while read -r id; do
+      ssh -o ConnectTimeout=5 root@"$h" "pct config $id 2>/dev/null" </dev/null 2>/dev/null | grep -q "ip=${ip}/" && echo "$id" && break
+    done)
+    if [[ -n "$vmid" ]]; then
+      echo "$h $vmid"
+      return 0
+    fi
+  done
+  echo "ไม่พบ container ที่ผูก IP '$ip' บน node ไหนเลย" >&2
+  return 1
+}
+
+# ---------- fix-ssh-keys: เติม standard key set ให้ครบ (แก้ปัญหา clone แล้ว authorized_keys ไม่ครบ) ----------
+# root cause ที่เจอจริง 31 ส.ค. 2569: container ตระกูล runic (runic/runic-b/runic-c, vmid 121-123)
+# ที่ clone กันวันนี้ล้วนมี authorized_keys แค่ 1 key (proxmox-dev) ขาด Mac/conductor/home-proxmox
+# ทำให้ SSH เข้าไม่ได้จากเครื่องอื่นนอก proxmox-dev แม้ container ทำงานปกติ (sshd active, TCP ok)
+# ต่างจาก app01-15 ที่ provision key ครบ 4 ตัวมาตั้งแต่แรก
+#
+# ใช้งาน: fleet-utils fix-ssh-keys <container-name หรือ IP>
+STANDARD_KEYS='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEWf7j4gBDR/4O+JSWMFGBCiJGtjHxH3z5ZIoXDCkDTT ammonium@AmMoNiums-MacBook-Pro.local
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGU012i01vg2/0KUzzdYBQvaYvc43FJxotHPVIrKvk18 ammonium@proxmox-dev
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILORvy2s1l7M7ILIPtk98tDvFH5+aLmDcdv2ooC9bjcu home-proxmox
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOJcgf70iyRLjKWxIPbppRRf7CgfSsjQ0gnygij6H/5M ammonium@conductor'
+
+fix_ssh_keys() {
+  local target="${1:?ระบุชื่อ container หรือ IP เช่น runic-c หรือ 192.168.88.214}"
+  local hostvmid pvehost vmid
+
+  if [[ "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    hostvmid=$(locate_lxc_by_ip "$target")
+  else
+    hostvmid=$(locate_lxc "$target")
+  fi
+  read -r pvehost vmid <<< "$hostvmid"
+
+  echo ">> ${target} อยู่บน ${pvehost} (vmid ${vmid})"
+  echo ">> ก่อนแก้ — authorized_keys ปัจจุบัน:"
+  ssh root@"$pvehost" "pct exec $vmid -- cat /home/ammonium/.ssh/authorized_keys 2>&1" || echo "   (ไม่มีไฟล์เดิม)"
+
+  ssh root@"$pvehost" "pct exec $vmid -- mkdir -p /home/ammonium/.ssh"
+  echo "$STANDARD_KEYS" | ssh root@"$pvehost" "pct exec $vmid -- tee /home/ammonium/.ssh/authorized_keys" > /dev/null
+  ssh root@"$pvehost" "pct exec $vmid -- chmod 700 /home/ammonium/.ssh"
+  ssh root@"$pvehost" "pct exec $vmid -- chmod 600 /home/ammonium/.ssh/authorized_keys"
+  ssh root@"$pvehost" "pct exec $vmid -- chown -R ammonium:ammonium /home/ammonium/.ssh"
+
+  echo ">> หลังแก้ — authorized_keys ใหม่:"
+  ssh root@"$pvehost" "pct exec $vmid -- cat /home/ammonium/.ssh/authorized_keys"
+  echo ">> เสร็จ — ทดสอบด้วย: ssh ammonium@<IP ของ ${target}>"
 }
 
 # ---------- runner-status: เช็ค GitHub Actions self-hosted runner ----------
@@ -187,8 +244,9 @@ case "$cmd" in
   runner-fix-all)   runner_fix_all ;;
   disk-survey)      disk_survey "$@" ;;
   disk-clean-safe)  disk_clean_safe "$@" ;;
+  fix-ssh-keys)     fix_ssh_keys "$@" ;;
   *)
-    echo "ใช้งาน: fleet-utils {discover|runner-status|runner-fix|runner-fix-all|disk-survey|disk-clean-safe} [args]"
+    echo "ใช้งาน: fleet-utils {discover|runner-status|runner-fix|runner-fix-all|disk-survey|disk-clean-safe|fix-ssh-keys} [args]"
     echo "ดูรายละเอียดที่คอมเมนต์หัวไฟล์ (~/.local/bin/fleet-utils)"
     exit 1
     ;;
